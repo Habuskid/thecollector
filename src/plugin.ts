@@ -65,12 +65,28 @@ const VAULT_PACKS: VaultPack[] = [
   },
 ];
 
-// Helper to fetch Renaiss API safely with timeout
+function getRenaissHeaders(): Record<string, string> {
+  const key = process.env.RENAISS_API_KEY || process.env.RENAISS_KEY_ID || process.env.VITE_RENAISS_API_KEY;
+  const secret = process.env.RENAISS_API_SECRET || process.env.RENAISS_SECRET || process.env.VITE_RENAISS_API_SECRET;
+  const headers: Record<string, string> = {
+    "Accept": "application/json",
+  };
+  if (key && secret) {
+    headers["X-Api-Key"] = key;
+    headers["X-Api-Secret"] = secret;
+  }
+  return headers;
+}
+
+// Helper to fetch Renaiss API safely with timeout and partner auth
 async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: getRenaissHeaders(),
+    });
     if (!res.ok) {
       throw new Error(`Renaiss API returned status ${res.status}`);
     }
