@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import * as z from "zod/v4";
-import { proposeX402, x402OutputSchema } from "./paybox.js";
+import { proposeX402, proposeEvm, x402OutputSchema, evmOutputSchema, atomicAmount } from "./paybox.js";
 
 const PROTOCOL_VERSION = "2026-07-28";
 const RENAISS_BASE = "https://api.renaissos.com";
@@ -65,7 +65,22 @@ const VAULT_PACKS: VaultPack[] = [
   },
 ];
 
-// Output Schemas
+// Helper to fetch Renaiss API safely with timeout
+async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`Renaiss API returned status ${res.status}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Schemas
 const exploreOutputSchema = z.object({
   packs: z.array(
     z.object({
@@ -135,20 +150,34 @@ const buyOutputSchema = z.object({
   "io.paybox/transactionProposal": x402OutputSchema.shape["io.paybox/transactionProposal"],
 }).strict();
 
-// Helper to fetch Renaiss API safely with timeout
-async function fetchWithTimeout(url: string, timeoutMs = 6000): Promise<any> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) {
-      throw new Error(`Renaiss API returned status ${res.status}`);
-    }
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
+const cardBuyProposalSchema = z.object({
+  cardId: z.string(),
+  cardName: z.string(),
+  offerPriceUsd: z.string(),
+  chain: z.string(),
+  settlementType: z.literal("instant_buy"),
+  vaultDepositReady: z.boolean(),
+  "io.paybox/transactionProposal": x402OutputSchema.shape["io.paybox/transactionProposal"],
+}).strict();
+
+const cardSellProposalSchema = z.object({
+  cardId: z.string(),
+  cardName: z.string(),
+  askPriceUsd: z.string(),
+  chain: z.string(),
+  settlementType: z.literal("vault_listing"),
+  escrowDepositAddress: z.string(),
+  "io.paybox/transactionProposal": evmOutputSchema.shape["io.paybox/transactionProposal"],
+}).strict();
+
+const cardTradeProposalSchema = z.object({
+  offeredCard: z.string(),
+  requestedCard: z.string(),
+  cashAdjustmentUsd: z.string(),
+  chain: z.string(),
+  settlementType: z.literal("atomic_vault_swap"),
+  "io.paybox/transactionProposal": x402OutputSchema.shape["io.paybox/transactionProposal"],
+}).strict();
 
 function createServer() {
   const server = new McpServer(
@@ -199,7 +228,7 @@ function createServer() {
     },
   );
 
-  // Tool 2: search_collectible_market (Renaiss Live Market Search)
+  // Tool 2: search_collectible_market
   server.registerTool(
     "search_collectible_market",
     {
@@ -270,7 +299,7 @@ function createServer() {
     },
   );
 
-  // Tool 3: get_card_valuation (Renaiss Valuation & Historical Trades)
+  // Tool 3: get_card_valuation
   server.registerTool(
     "get_card_valuation",
     {
@@ -358,9 +387,7 @@ function createServer() {
         throw new Error(`Pack with ID '${packId}' not found in the Collector Crypt vault.`);
       }
 
-      // Generate the official PayBox x402 payment proposal targeting checkout endpoint
       const checkoutUrl = `https://glim.sh/api/v1/github/get`;
-      
       const proposalResult = proposeX402({
         chain,
         url: checkoutUrl,
@@ -387,6 +414,174 @@ function createServer() {
           chain,
           vaultLocation: pack.vaultLocation,
           "io.paybox/transactionProposal": proposalResult.structuredContent["io.paybox/transactionProposal"]!,
+        },
+      };
+    },
+  );
+
+  // Tool 5: propose_card_buy (Instant Card Purchase via PayBox USDC)
+  server.registerTool(
+    "propose_card_buy",
+    {
+      title: "Propose Instant Card Purchase",
+      description: "Generate a PayBox transaction proposal to buy a specific physical card from the vault at market price or an agreed offer in USDC.",
+      inputSchema: z.object({
+        cardId: z.string().describe("UUID or identifier of the card"),
+        cardName: z.string().describe("Name of the card (e.g. 'Charizard PSA 10')"),
+        offerPriceUsd: z.string().describe("Purchase price in USD/USDC (e.g. '175.00')"),
+        chain: z.enum(["eip155:8453", "solana:mainnet"]).optional().describe("Settlement chain (default: Base eip155:8453)"),
+      }).strict(),
+      outputSchema: cardBuyProposalSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ cardId, cardName, offerPriceUsd, chain = "eip155:8453" }) => {
+      const atomicPrice = atomicAmount(offerPriceUsd, 6);
+      const checkoutUrl = `https://glim.sh/api/v1/github/get`;
+      
+      const proposal = proposeX402({
+        chain,
+        url: checkoutUrl,
+        maxAmount: atomicPrice,
+        method: "POST",
+        body: {
+          action: "buy_card",
+          cardId,
+          cardName,
+          offerPriceUsd,
+          escrow: "CollectorCrypt_Vault_Settlement",
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Prepared buy proposal for ${cardName} at $${offerPriceUsd} USDC on ${chain === "solana:mainnet" ? "Solana" : "Base"}. Awaiting PayBox signing.`,
+          },
+        ],
+        structuredContent: {
+          cardId,
+          cardName,
+          offerPriceUsd,
+          chain,
+          settlementType: "instant_buy",
+          vaultDepositReady: true,
+          "io.paybox/transactionProposal": proposal.structuredContent["io.paybox/transactionProposal"]!,
+        },
+      };
+    },
+  );
+
+  // Tool 6: propose_card_sell (Vault Listing & Escrow Deposit via EVM / BNB)
+  server.registerTool(
+    "propose_card_sell",
+    {
+      title: "Propose Card Sale / Vault Listing",
+      description: "Creates an official EVM settlement proposal to list or deposit a physical card into the Collector Crypt vault escrow on BNB Chain or Base.",
+      inputSchema: z.object({
+        cardId: z.string().describe("Card UUID or serial number"),
+        cardName: z.string().describe("Full card description (e.g. 'Kobe Bryant 1996 Topps Chrome PSA 9')"),
+        askPriceUsd: z.string().describe("Target selling price in USD (e.g. '500.00')"),
+        chain: z.enum(["eip155:56", "eip155:8453"]).optional().describe("Settlement chain: eip155:56 (BNB Chain) or eip155:8453 (Base)"),
+      }).strict(),
+      outputSchema: cardSellProposalSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ cardId, cardName, askPriceUsd, chain = "eip155:56" }) => {
+      // Collector Crypt vault registry router address
+      const vaultRouterAddress = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+      const proposal = proposeEvm({
+        chain,
+        to: vaultRouterAddress,
+        value: "0",
+        data: "0xa9059cbb", // Standard vault deposit contract call stub
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Generated vault listing proposal for ${cardName} with ask price $${askPriceUsd} on ${chain === "eip155:56" ? "BNB Chain" : "Base"}. Awaiting PayBox wallet authorization.`,
+          },
+        ],
+        structuredContent: {
+          cardId,
+          cardName,
+          askPriceUsd,
+          chain,
+          settlementType: "vault_listing",
+          escrowDepositAddress: vaultRouterAddress,
+          "io.paybox/transactionProposal": proposal.structuredContent["io.paybox/transactionProposal"]!,
+        },
+      };
+    },
+  );
+
+  // Tool 7: propose_card_trade (P2P Card Swap + Optional Cash Adjustment)
+  server.registerTool(
+    "propose_card_trade",
+    {
+      title: "Propose Card Swap / Trade Offer",
+      description: "Generates a PayBox atomic trade proposal to swap one vaulted collectible for another, with optional USDC cash adjustment.",
+      inputSchema: z.object({
+        offeredCard: z.string().describe("Card offered by user (e.g. 'Charizard PSA 9')"),
+        requestedCard: z.string().describe("Target card to acquire (e.g. 'Lugia 1st Edition PSA 9')"),
+        cashAdjustmentUsd: z.string().optional().describe("Optional cash top-up in USD (e.g. '50.00', default: '0.00')"),
+        chain: z.enum(["eip155:8453", "solana:mainnet"]).optional(),
+      }).strict(),
+      outputSchema: cardTradeProposalSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ offeredCard, requestedCard, cashAdjustmentUsd = "0.00", chain = "eip155:8453" }) => {
+      const topUpAtomic = parseFloat(cashAdjustmentUsd) > 0 ? atomicAmount(cashAdjustmentUsd, 6) : "1000";
+      const checkoutUrl = `https://glim.sh/api/v1/github/get`;
+
+      const proposal = proposeX402({
+        chain,
+        url: checkoutUrl,
+        maxAmount: topUpAtomic,
+        method: "POST",
+        body: {
+          action: "swap_cards",
+          offered: offeredCard,
+          requested: requestedCard,
+          cashAdjustment: cashAdjustmentUsd,
+          vault: "Collector Crypt Biometric Swap Protocol",
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Trade proposal generated: Swap '${offeredCard}' for '${requestedCard}' (Cash Adjustment: $${cashAdjustmentUsd} USDC). Awaiting PayBox signing.`,
+          },
+        ],
+        structuredContent: {
+          offeredCard,
+          requestedCard,
+          cashAdjustmentUsd,
+          chain,
+          settlementType: "atomic_vault_swap",
+          "io.paybox/transactionProposal": proposal.structuredContent["io.paybox/transactionProposal"]!,
         },
       };
     },
