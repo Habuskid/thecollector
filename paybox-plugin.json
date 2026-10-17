@@ -1,0 +1,6 @@
+{
+  "tool": "explore_vault_packs",
+  "arguments": {
+    "category": "pokemon"
+  }
+}
